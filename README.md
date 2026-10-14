@@ -7,7 +7,7 @@ Jeu de données : `Advertising.csv` (200 observations).
 - Cible : `sales` (ventes, en milliers de $)
 
 ```
-Streamlit (formulaire) --HTTP/JSON--> FastAPI --> scaler.transform --> model.predict --> JSON --> Streamlit
+Streamlit (formulaire) --HTTP/JSON--> FastAPI --> pipeline.predict (scaler + modèle) --> JSON --> Streamlit
 ```
 
 ## Structure finale du projet
@@ -20,13 +20,12 @@ demo-regression/
 ├── .env                  # réglages locaux (non versionné)
 ├── .env.example          # modèle de .env (versionné)
 ├── README.md
-├── train_model.py        # (optionnel) recrée les fichiers .joblib
+├── train_model.py        # découpe, entraîne et sauvegarde le pipeline
 ├── test_api.py           # test de l'API en Python
 ├── data/
 │   └── Advertising.csv
 ├── models/
-│   ├── model_scaled.joblib
-│   └── scaler.joblib
+│   └── pipeline.joblib   # scaler + régression, créé par train_model.py
 ├── api/
 │   ├── __init__.py
 │   ├── main.py           # routes de l'API
@@ -70,24 +69,23 @@ mkdir api/schemas
 
 Supprimez le `main.py` généré par défaut (`rm main.py` sous Linux/macOS, `del main.py` sous Windows).
 
-> **Pourquoi `scikit-learn==1.6.1` ?** Un fichier `.joblib` doit être relu avec la version de scikit-learn qui l'a créé, sinon des avertissements (voire des erreurs) apparaissent. Adaptez ce numéro à la version utilisée pour entraîner votre modèle.
+> **Pourquoi `scikit-learn==1.6.1` ?** Un fichier `.joblib` doit être relu avec la version de scikit-learn qui l'a créé, sinon des avertissements (voire des erreurs) apparaissent. Épingler le numéro garantit que tous les postes, et plus tard le serveur de déploiement, utilisent la même version. Pour connaître la vôtre : `import sklearn; print(sklearn.__version__)`.
 
 > **Pourquoi `uvicorn[standard]` ?** Le suffixe ajoute des dépendances optionnelles, dont `watchfiles`, qui permet le rechargement automatique (`--reload`) en développement.
 
 > **Pourquoi `python-dotenv` ?** Il lit le fichier `.env` (voir l'étape 7). Il est déjà installé indirectement par `uvicorn[standard]`, mais on le déclare explicitement puisque notre code l'utilise.
 
-## Étape 3 : obtenir le modèle et le scaler
+## Étape 3 : entraîner et sauvegarder le pipeline
 
-Placez `Advertising.csv` dans `data/`.
-
-**Option A : vous avez déjà `model_scaled.joblib` et `scaler.joblib`** (issus du notebook Colab). Copiez-les dans `models/`.
-
-**Option B : les recréer** avec ce script `train_model.py` (à la racine) :
+Placez `Advertising.csv` dans `data/`, puis créez `train_model.py` à la racine du projet :
 
 ```python
 import joblib
 import pandas as pd
 from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 # 1. Chargement des données
@@ -95,33 +93,70 @@ df = pd.read_csv("data/Advertising.csv")
 X = df[["TV", "radio", "newspaper"]]   # l'ordre des colonnes est important
 y = df["sales"]
 
-# 2. Standardisation : moyenne 0, écart-type 1 pour chaque variable
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+# 2. Découpage : 80 % pour apprendre, 20 % pour évaluer sur des données jamais vues
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
 
-# 3. Entraînement de la régression linéaire multiple
-model = LinearRegression()
-model.fit(X_scaled, y)
+# 3. Pipeline : standardisation puis régression linéaire, enchaînées dans UN objet
+pipeline = Pipeline([
+    ("scaler", StandardScaler()),
+    ("regression", LinearRegression()),
+])
 
-# 4. Sauvegarde des deux objets
-joblib.dump(model, "models/model_scaled.joblib")
-joblib.dump(scaler, "models/scaler.joblib")
+# 4. Entraînement sur le jeu d'apprentissage uniquement
+pipeline.fit(X_train, y_train)
 
-print("Coefficients :", model.coef_)
+# 5. Évaluation sur le jeu de test
+y_pred = pipeline.predict(X_test)
+print(f"R²   : {r2_score(y_test, y_pred):.3f}")
+print(f"RMSE : {mean_squared_error(y_test, y_pred) ** 0.5:.3f}")
+print(f"MAE  : {mean_absolute_error(y_test, y_pred):.3f}")
+
+# 6. Sauvegarde d'un seul fichier : le pipeline complet
+joblib.dump(pipeline, "models/pipeline.joblib")
+
+# 7. Contrôle : un coefficient par variable (sur données standardisées)
+print("Coefficients :", pipeline.named_steps["regression"].coef_)
 ```
 
 ```bash
 uv run python train_model.py
 ```
 
-Les coefficients doivent être proches de `[3.76, 2.79, 0.056]`. Le coefficient de `newspaper` est quasi nul : ce canal n'explique presque rien des ventes.
+Résultat attendu (relevé en exécutant ce script sur le jeu de données du projet ; ces valeurs correspondent à celles du notebook d'origine) :
 
-> Si votre notebook utilisait un découpage train/test, vos valeurs pourront différer légèrement.
+```
+R²   : 0.899
+RMSE : 1.782
+MAE  : 1.461
+Coefficients : [3.76419618 2.79230665 0.05597551]
+```
+
+### Pourquoi `train_test_split` ?
+
+Évaluer un modèle sur les données qui ont servi à l'entraîner est trompeur : il peut simplement les « retenir ». On met donc de côté 20 % des lignes (`test_size=0.2`) que le modèle ne voit jamais pendant l'apprentissage, puis on mesure sa qualité sur elles. `random_state=42` fixe le tirage au sort : le découpage est identique à chaque exécution, les résultats sont reproductibles.
+
+### Pourquoi un `Pipeline` ?
+
+Un `Pipeline` enchaîne plusieurs étapes (ici `StandardScaler` puis `LinearRegression`) dans **un seul objet** :
+
+- **Un seul fichier** à sauvegarder et à charger (`pipeline.joblib`), au lieu de deux (modèle et scaler) qu'il faudrait garder synchronisés.
+- **`predict` standardise automatiquement** avant de prédire : l'API n'a plus à appeler `scaler.transform` elle-même, donc ne peut plus l'oublier.
+- **Pas de fuite de données** : `fit` calcule la moyenne et l'écart-type sur le jeu d'apprentissage seulement. Standardiser *avant* le découpage laisserait des informations du jeu de test dans le scaler.
+
+### Lire les résultats
+
+- **R² ≈ 0,90** : le modèle explique environ 90 % de la variation des ventes sur le jeu de test.
+- **RMSE ≈ 1,78** et **MAE ≈ 1,46** : erreurs en milliers de $, soit environ 1 780 $ (écart typique) et 1 460 $ (erreur absolue moyenne).
+- **Coefficients** (dans l'ordre TV, radio, newspaper), calculés sur des données standardisées, donc comparables : la TV (3,76) et la radio (2,79) pèsent fortement sur les ventes, les journaux (0,056) presque pas.
+
+> Ce pipeline est entraîné sur 80 % des données. En production, on réentraîne parfois sur la totalité une fois l'évaluation faite ; ici on garde le pipeline évalué, pour que les chiffres affichés correspondent au modèle réellement utilisé.
 
 **Vérification :**
 
 ```bash
-uv run python -c "import joblib; m = joblib.load('models/model_scaled.joblib'); print(m.coef_)"
+uv run python -c "import joblib; p = joblib.load('models/pipeline.joblib'); print(p.named_steps['regression'].coef_)"
 ```
 
 ## Étape 4 : l'API FastAPI (squelette)
@@ -137,9 +172,8 @@ from fastapi import FastAPI
 # Chemin du dossier models/, calculé depuis l'emplacement de ce fichier
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
-# Chargés une seule fois, au démarrage de l'API
-model = joblib.load(MODELS_DIR / "model_scaled.joblib")
-scaler = joblib.load(MODELS_DIR / "scaler.joblib")
+# Pipeline complet (standardisation + régression), chargé une seule fois au démarrage
+pipeline = joblib.load(MODELS_DIR / "pipeline.joblib")
 
 app = FastAPI(title="API de prédiction des ventes")
 
@@ -199,8 +233,7 @@ from .schemas import Budget
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
-model = joblib.load(MODELS_DIR / "model_scaled.joblib")
-scaler = joblib.load(MODELS_DIR / "scaler.joblib")
+pipeline = joblib.load(MODELS_DIR / "pipeline.joblib")
 
 app = FastAPI(title="API de prédiction des ventes")
 
@@ -217,12 +250,13 @@ def predict(budgets: Budget):
         [[budgets.TV, budgets.radio, budgets.newspaper]],
         columns=["TV", "radio", "newspaper"],
     )
-    X_scaled = scaler.transform(X)           # 1) standardiser (scaler déjà ajusté)
-    sales = model.predict(X_scaled)[0]       # 2) prédire
+    sales = pipeline.predict(X)[0]   # standardise PUIS prédit, en un seul appel
     return {"sales": round(float(sales), 2)}
 ```
 
 Le point dans `from .schemas import Budget` signifie « dans le même paquet que ce fichier » (le dossier `api/`). L'API se recharge seule : vérifiez que `POST /predict` apparaît dans `/docs`.
+
+> **Un seul appel, plus de scaler dans l'API.** `pipeline.predict(X)` enchaîne la standardisation puis la prédiction. Le pipeline mémorise aussi les noms de colonnes vus à l'entraînement : si le DataFrame porte d'autres noms ou un autre ordre, scikit-learn lève une `ValueError` au lieu de produire un résultat faux en silence (constaté avec scikit-learn 1.9.1). Ce contrôle n'existe pas si l'on passe un simple tableau numpy sans noms de colonnes : d'où le DataFrame.
 
 ## Étape 6 : tester l'API
 
@@ -356,7 +390,7 @@ __pycache__/
 .streamlit/secrets.toml
 ```
 
-À **versionner** : `pyproject.toml`, `uv.lock` (dépendances exactes), `.env.example`, et `models/*.joblib` (indispensables à la prédiction, et légers ici).
+À **versionner** : `pyproject.toml`, `uv.lock` (dépendances exactes), `.env.example`, et `models/pipeline.joblib` (indispensable à la prédiction, et léger ici).
 
 ## Cloner et relancer le projet
 
@@ -381,6 +415,8 @@ uv run streamlit run app/streamlit_app.py     # terminal 2
 | `ImportError: attempted relative import...` | `main.py` lancé directement | Utiliser `uv run uvicorn api.main:app` |
 | Le `.env` semble ignoré | `load_dotenv()` absent ou appelé après la lecture de `API_URL` | L'appeler avant `os.environ.get` |
 | Les modifications n'ont aucun effet | Ancienne instance de Streamlit toujours active (autre port) | Tout arrêter (Ctrl+C), relancer une seule fois |
+| `FileNotFoundError` sur `pipeline.joblib` | Le pipeline n'a pas encore été créé | Lancer `uv run python train_model.py` |
+| `ValueError: The feature names should match...` | Colonnes du DataFrame différentes de l'entraînement (noms ou ordre) | Utiliser `["TV", "radio", "newspaper"]`, dans cet ordre |
 | Avertissement scikit-learn à la lecture du `.joblib` | Versions différentes | Épingler la version utilisée à l'entraînement |
 
 ## Pistes d'évolution
@@ -388,3 +424,4 @@ uv run streamlit run app/streamlit_app.py     # terminal 2
 - Un schéma de réponse (`PredictionResponse`) pour documenter aussi la sortie dans `/docs`.
 - Déploiement : Streamlit Community Cloud ne héberge que l'interface ; l'API doit l'être ailleurs (par exemple Render), puis `API_URL` doit pointer vers cette adresse.
 - Ajouter des tests automatisés (pytest) pour `/predict`.
+- Validation croisée (`cross_val_score`) et recherche d'hyperparamètres (`GridSearchCV`) : ils s'appliquent directement au pipeline, sans fuite de données.
